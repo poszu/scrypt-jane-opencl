@@ -1,0 +1,16 @@
+[package]
+name = "scrypt-ocl"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+bytemuck = "1.13.1"
+ocl = "0.19.4"
+opencl3 = "0.9.2"
+
+
+[[bench]]
+name = "scrypting"
+# harness = false
