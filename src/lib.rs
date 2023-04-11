@@ -1,92 +1,122 @@
 extern crate ocl;
-use ocl::{enums::DeviceInfo, Buffer, Kernel, ProQue, SpatialDims};
+use ocl::{
+    enums::{DeviceInfo, KernelWorkGroupInfo},
+    Buffer, Kernel, MemFlags, ProQue, SpatialDims,
+};
 
+#[derive(Debug)]
 pub struct Scrypter {
     kernel: Kernel,
-    output: Buffer<u32>,
+    output: Buffer<u8>,
+    max_wg_size: usize,
 }
 
 impl Scrypter {
-    pub fn new(n: u32) -> Self {
+    pub fn new(n: usize) -> ocl::Result<Self> {
         let src = include_str!("scrypt-jane.cl");
-        let pro_que = ProQue::builder().src(src).dims(128).build().unwrap();
+        let mut pro_que = ProQue::builder().src(src).build()?;
 
         println!("Device name: {:?}", pro_que.device().info(DeviceInfo::Name));
-        // println!("Device: {}", pro_que.device().to_string());
-        println!("Device max_wg_size: {:?}", pro_que.device().max_wg_size());
+        println!(
+            "Device: {:?}",
+            pro_que.device().info(DeviceInfo::PreferredVectorWidthInt)
+        );
+        println!(
+            "Max compute size: {}",
+            pro_que.device().info(DeviceInfo::MaxComputeUnits)?
+        );
+        let max_wg_size = pro_que.device().max_wg_size()?;
+        println!("Device max_wg_size: {max_wg_size}");
+
+        pro_que.set_dims(SpatialDims::One(max_wg_size));
 
         let input = Buffer::<u32>::builder()
             .len(8)
             .queue(pro_que.queue().clone())
-            .build()
-            .unwrap();
-        let output = Buffer::<u32>::builder()
-            .len(128 * 4)
-            .fill_val(0)
-            .queue(pro_que.queue().clone())
-            .build()
-            .unwrap();
+            .build()?;
 
-        // size_t ipt = (1024 / 1);
-        // size_t bufsize = 128 * ipt * cgpu->thread_concurrency;
-        let padcache = Buffer::<u8>::builder()
-            .len(128 * 1024 * 256)
+        let output = Buffer::<u8>::builder()
+            .len(max_wg_size * 16)
             .fill_val(0)
             .queue(pro_que.queue().clone())
-            .build()
-            .unwrap();
+            .build()?;
+
+        let lookup_gap = 4;
+        let pad_size = max_wg_size * 16 * 8 * (n / lookup_gap);
+
+        let padcache = Buffer::<u8>::builder()
+            .len(pad_size)
+            .flags(MemFlags::new().host_no_access())
+            .fill_val(0)
+            .queue(pro_que.queue().clone())
+            .build()?;
 
         let kernel = pro_que
             .kernel_builder("scrypt")
-            .global_work_offset((0, 0, 0))
-            .arg(n)
+            .arg(n as u32)
+            .arg(0)
             .arg(&input)
             .arg(&output)
             .arg(&padcache)
-            .build()
-            .unwrap();
+            .build()?;
 
-        Self { kernel, output }
+        let preferred_wg_size_mult = kernel.wg_info(
+            pro_que.device(),
+            KernelWorkGroupInfo::PreferredWorkGroupSizeMultiple,
+        )?;
+
+        println!("Kernel PreferredWorkGroupSizeMultiple: {preferred_wg_size_mult}");
+
+        Ok(Self {
+            kernel,
+            output,
+            max_wg_size,
+        })
     }
 
     pub fn scrypt(&mut self, labels: usize) -> ocl::Result<Vec<u8>> {
         let mut vec = vec![0u8; labels * 16];
-        for id in (0..labels).step_by(128) {
-            println!("Enquing with offset {id}");
+        for (id, chunk) in vec.chunks_mut(self.max_wg_size * 16).enumerate() {
+            let start_index = self.max_wg_size * id;
+            self.kernel.set_arg(1, start_index as u32)?;
             unsafe {
-                self.kernel
-                    .cmd()
-                    .global_work_offset(SpatialDims::One(id))
-                    .local_work_size(128)
-                    .enq()
-                    .unwrap();
+                self.kernel.cmd().enq()?;
             }
 
-            let out_slice = bytemuck::cast_slice_mut::<u8, u32>(
-                &mut vec.as_mut_slice()[id * 16..(id + 128) * 16],
-            );
-            self.output.read(out_slice).enq().unwrap();
+            self.output.read(chunk).enq()?;
         }
         Ok(vec)
     }
 }
 
-// EXPECTED result...
-// [a8, 17, e7, a3, 2d, eb, ae, 46, c2, 93, 61, 0b, 9d, fa, 99, da]
-// [dd, 61, 4b, cf, ae, f8, 70, 2a, 19, 12, 00, 45, 8c, e6, c9, df]
-// [5f, a9, 29, 07, a2, 03, fa, ac, 15, f2, a3, aa, 97, 46, 63, 0b]
-// [ae, e3, 0f, c7, 4c, c9, b2, 75, 48, 8f, e8, cc, a4, f3, 98, 9f]
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
 
-#[test]
-fn test_scrypt() {
-    let mut scrypter = Scrypter::new(512);
+    use super::*;
 
-    let labels = scrypter.scrypt(256).unwrap();
-    for i in 0..256 {
-        println!(
-            "Output[{:04X}]: {:02x?}",
-            i * 16,
-            &labels[i * 16..(i + 1) * 16],
-        );
+    #[test]
+    fn test_scrypt() {
+        let mut scrypter = Scrypter::new(8192).unwrap();
+
+        let labels = scrypter.scrypt(2 * 1024).unwrap();
+        let mut file = std::fs::File::create("labels.bin").unwrap();
+        file.write_all(&labels).unwrap();
+
+        for i in 0..4 {
+            println!(
+                "Output[{:04X}]: {:02x?}",
+                i * 16,
+                &labels[i * 16..(i + 1) * 16],
+            );
+        }
+
+        for i in 1020..1030 {
+            println!(
+                "Output[{:04X}]: {:02x?}",
+                i * 16,
+                &labels[i * 16..(i + 1) * 16],
+            );
+        }
     }
 }
