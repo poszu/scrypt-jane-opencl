@@ -18,7 +18,7 @@
 #define ROTL64(x, y) as_uint2(rotate(as_ulong(x), y))
 #define ROTL32(x, y) rotate(x, y)
 
-#define LOOKUP_GAP 4
+#define LOOKUP_GAP 2
 
 typedef struct scrypt_hash_state_t {
   uint4 state4[(SCRYPT_KECCAK_F + 127) / 128];       // 8 bytes of extra
@@ -454,8 +454,7 @@ static void scrypt_copy_hmac_state_128B(scrypt_hmac_state *dest,
 __constant uint be1 = 0x01000000;
 __constant uint be2 = 0x02000000;
 
-static void scrypt_pbkdf2_128B(const uint4 *password, const uint4 *salt,
-                               uint4 *out4) {
+static void scrypt_pbkdf2_128B(const uint4 *password, uint4 *out4) {
   scrypt_hmac_state hmac_pw, work;
   uint4 ti4[4];
   uint i;
@@ -551,7 +550,6 @@ __constant uint4 ROTATE_7 = (uint4)(7, 7, 7, 7);
 static void chacha_core(uint4 *restrict state) {
   uint4 x[4];
   uint4 t;
-  uint rounds;
 
   x[0] = state[0];
   x[1] = state[1];
@@ -559,7 +557,7 @@ static void chacha_core(uint4 *restrict state) {
   x[3] = state[3];
 
 #pragma unroll
-  for (rounds = 0; rounds < 4; rounds++) {
+  for (uint rounds = 0; rounds < 4; rounds++) {
     x[0] += x[1];
     t = x[3] ^ x[0];
     x[3] = ROTL32(t, ROTATE_16);
@@ -613,7 +611,8 @@ scrypt_ChunkMix_inplace_Bxor_local(uint4 *restrict B /*[chunkWords]*/,
   B[2] ^= B[6] ^ Bxor[6] ^ Bxor[2];
   B[3] ^= B[7] ^ Bxor[7] ^ Bxor[3];
 
-  /* SCRYPT_MIX_FN */ chacha_core(B);
+  /* SCRYPT_MIX_FN */
+  chacha_core(B);
 
   /* 4: Y_i = X */
   /* 6: B'[0..r-1] = Y_even */
@@ -625,7 +624,8 @@ scrypt_ChunkMix_inplace_Bxor_local(uint4 *restrict B /*[chunkWords]*/,
   B[6] ^= B[2] ^ Bxor[6];
   B[7] ^= B[3] ^ Bxor[7];
 
-  /* SCRYPT_MIX_FN */ chacha_core(B + 4);
+  /* SCRYPT_MIX_FN */
+  chacha_core(B + 4);
 
   /* 4: Y_i = X */
   /* 6: B'[0..r-1] = Y_even */
@@ -642,7 +642,8 @@ static void scrypt_ChunkMix_inplace_local(uint4 *restrict B /*[chunkWords]*/) {
   B[2] ^= B[6];
   B[3] ^= B[7];
 
-  /* SCRYPT_MIX_FN */ chacha_core(B);
+  /* SCRYPT_MIX_FN */
+  chacha_core(B);
 
   /* 4: Y_i = X */
   /* 6: B'[0..r-1] = Y_even */
@@ -654,7 +655,8 @@ static void scrypt_ChunkMix_inplace_local(uint4 *restrict B /*[chunkWords]*/) {
   B[6] ^= B[2];
   B[7] ^= B[3];
 
-  /* SCRYPT_MIX_FN */ chacha_core(B + 4);
+  /* SCRYPT_MIX_FN */
+  chacha_core(B + 4);
 
   /* 4: Y_i = X */
   /* 6: B'[0..r-1] = Y_even */
@@ -662,9 +664,9 @@ static void scrypt_ChunkMix_inplace_local(uint4 *restrict B /*[chunkWords]*/) {
 }
 
 #define Coord(x, y, z) x + y *(x##SIZE) + z *(y##SIZE) * (x##SIZE)
-#define CO Coord(x, y, z)
+#define CO Coord(z, x, y)
 
-static void scrypt_ROMix(uint4 *restrict X, __global uint4 *restrict lookup,
+static void scrypt_ROMix(uint4 *restrict X, global uint4 *restrict lookup,
                          const uint N) {
 
   const uint zSIZE = 8;
@@ -738,10 +740,11 @@ static void scrypt_ROMix(uint4 *restrict X, __global uint4 *restrict lookup,
   /* implicit */
 }
 
-__kernel void scrypt(__private const uint N, __private const uint index,
-                     __global const uint4 *const restrict input,
-                     __global uchar *const restrict output,
-                     __global uchar *const restrict padcache) {
+kernel void scrypt(private const uint N, private const uint index,
+                   global const uint4 *const restrict input,
+                   global uchar *const restrict output,
+                   global uint4 *const restrict padcache) {
+
   uint4 password[5];
   uint4 X[8];
 
@@ -756,17 +759,12 @@ __kernel void scrypt(__private const uint N, __private const uint index,
   password[4] = 0;
 
   /* 1: X = PBKDF2(password, salt) */
-  uint4 salt[32];
-  for (int i = 0; i < 32; i++) {
-    salt[i] = 0;
-  }
-
-  scrypt_pbkdf2_128B(password, salt, X);
+  scrypt_pbkdf2_128B(password, X);
 
   /* 2: X = ROMix(X) */
-  scrypt_ROMix(X, (__global uint4 *)padcache, N);
+  scrypt_ROMix(X, padcache, N);
 
   /* 3: Out = PBKDF2(password, X) */
-  __global uint4 *restrict out4 = (__global uint4 *)output;
+  global uint4 *restrict out4 = (global uint4 *)output;
   out4[gid] = scrypt_pbkdf2_16B(password, X);
 }

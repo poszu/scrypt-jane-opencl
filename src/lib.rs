@@ -1,4 +1,5 @@
 extern crate ocl;
+
 use ocl::{
     enums::{DeviceInfo, KernelWorkGroupInfo},
     Buffer, Kernel, MemFlags, ProQue, SpatialDims,
@@ -8,46 +9,45 @@ use ocl::{
 pub struct Scrypter {
     kernel: Kernel,
     output: Buffer<u8>,
-    max_wg_size: usize,
+    global_work_size: usize,
 }
+
+const LABEL_SIZE: usize = 16;
 
 impl Scrypter {
     pub fn new(n: usize) -> ocl::Result<Self> {
         let src = include_str!("scrypt-jane.cl");
         let mut pro_que = ProQue::builder().src(src).build()?;
 
-        println!("Device name: {:?}", pro_que.device().info(DeviceInfo::Name));
-        println!(
-            "Device: {:?}",
-            pro_que.device().info(DeviceInfo::PreferredVectorWidthInt)
-        );
+        println!("Device name: {}", pro_que.device().info(DeviceInfo::Name)?);
         println!(
             "Max compute size: {}",
             pro_que.device().info(DeviceInfo::MaxComputeUnits)?
         );
         let max_wg_size = pro_que.device().max_wg_size()?;
         println!("Device max_wg_size: {max_wg_size}");
+        let global_work_size = max_wg_size * 4;
 
-        pro_que.set_dims(SpatialDims::One(max_wg_size));
+        pro_que.set_dims(SpatialDims::One(global_work_size));
 
         let input = Buffer::<u32>::builder()
             .len(8)
+            .flags(MemFlags::new().read_only())
             .queue(pro_que.queue().clone())
             .build()?;
 
         let output = Buffer::<u8>::builder()
-            .len(max_wg_size * 16)
-            .fill_val(0)
+            .len(global_work_size * LABEL_SIZE)
+            .flags(MemFlags::new().write_only())
             .queue(pro_que.queue().clone())
             .build()?;
 
-        let lookup_gap = 4;
-        let pad_size = max_wg_size * 16 * 8 * (n / lookup_gap);
+        let lookup_gap = 2;
+        let pad_size = global_work_size * 4 * 8 * (n / lookup_gap);
 
-        let padcache = Buffer::<u8>::builder()
+        let padcache = Buffer::<u32>::builder()
             .len(pad_size)
             .flags(MemFlags::new().host_no_access())
-            .fill_val(0)
             .queue(pro_que.queue().clone())
             .build()?;
 
@@ -58,6 +58,8 @@ impl Scrypter {
             .arg(&input)
             .arg(&output)
             .arg(&padcache)
+            .global_work_size(SpatialDims::One(global_work_size))
+            .local_work_size(128)
             .build()?;
 
         let preferred_wg_size_mult = kernel.wg_info(
@@ -70,17 +72,20 @@ impl Scrypter {
         Ok(Self {
             kernel,
             output,
-            max_wg_size,
+            global_work_size,
         })
     }
 
     pub fn scrypt(&mut self, labels: usize) -> ocl::Result<Vec<u8>> {
-        let mut vec = vec![0u8; labels * 16];
-        for (id, chunk) in vec.chunks_mut(self.max_wg_size * 16).enumerate() {
-            let start_index = self.max_wg_size * id;
+        let mut vec = vec![0u8; labels * LABEL_SIZE];
+        for (id, chunk) in vec
+            .chunks_mut(self.global_work_size * LABEL_SIZE)
+            .enumerate()
+        {
+            let start_index = self.global_work_size * id;
             self.kernel.set_arg(1, start_index as u32)?;
             unsafe {
-                self.kernel.cmd().enq()?;
+                self.kernel.enq()?;
             }
 
             self.output.read(chunk).enq()?;
